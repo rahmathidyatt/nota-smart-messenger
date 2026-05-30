@@ -4,43 +4,57 @@ Aplikasi Nota Smart Messenger
 Dibuat untuk membantu Staff Operasional menghitung tagihan
 Smart Messenger berdasarkan format nota Brighton.
 
-Teknologi: Streamlit + Python
+Teknologi: Streamlit + Python + Pillow + ReportLab
 Cara menjalankan lokal:
     streamlit run app.py
 
 Catatan rumus utama:
-    BBM  = max(jarak_akumulasi * tarif_per_km, minimum_bbm) jika minimum aktif
-    Jasa = jumlah_titik_pekerjaan * biaya_jasa_per_titik
+    BBM  = jarak_akumulasi x tarif_per_km
+    Jika jarak kurang dari batas minimum, BBM memakai tarif minimum.
+    Jasa = jumlah_titik_pekerjaan x biaya_jasa_per_titik
     Total = BBM + Jasa
 
 Contoh dari gambar:
     18,8 KM x Rp900 + Rp5.000 = Rp21.920
     50 KM x Rp900 + Rp10.000 = Rp55.000
+
+Catatan teknis:
+    PDF dibuat dari gambar nota yang sama dengan preview.
+    Tujuannya agar hasil download PDF selalu rapi, tidak berubah karena masalah
+    wrapping teks/logo pada ReportLab Table.
 """
 
 from __future__ import annotations
 
-import html
 import io
+import os
+import re
 from dataclasses import dataclass
 from datetime import date
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Sequence, Tuple
 
 import pandas as pd
 import streamlit as st
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from PIL import Image, ImageDraw, ImageFont
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import cm
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 
 # -----------------------------------------------------------------------------
-# Konstanta tampilan dan format dasar
+# Konstanta aplikasi
 # -----------------------------------------------------------------------------
 APP_TITLE = "Nota Smart Messenger"
 MAX_TEMPLATE_ROWS = 14
 BRIGHTON_YELLOW = "#ffc000"
+BRIGHTON_YELLOW_RGB = (255, 192, 0)
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+
+# Ukuran dasar mengikuti rasio A4 landscape agar saat masuk PDF tidak gepeng.
+# 1400 x 990 = rasio ± 1.414, sama seperti A4 landscape.
+BASE_WIDTH = 1400
+BASE_HEIGHT = 990
+
 MONTHS_EN = [
     "Jan",
     "Feb",
@@ -59,7 +73,7 @@ MONTHS_EN = [
 
 @dataclass
 class CalculationConfig:
-    """Menyimpan aturan perhitungan agar mudah diubah dari sidebar."""
+    """Aturan tarif yang bisa diubah dari sidebar aplikasi."""
 
     tariff_per_km: int = 900
     minimum_distance_km: float = 10.0
@@ -105,15 +119,16 @@ def format_number_id(value: float | int) -> str:
 
 
 def format_date_display(value: date | None) -> str:
-    """Format tanggal seperti template: 19-May-26."""
+    """Format tanggal seperti template nota: 19-May-26."""
     if not value:
         return "-"
     return f"{value.day:02d}-{MONTHS_EN[value.month - 1]}-{str(value.year)[-2:]}"
 
 
-def safe_text(value: Any) -> str:
-    """Escape teks agar aman saat dirender ke HTML."""
-    return html.escape(str(value or ""), quote=True)
+def sanitize_filename(text: str) -> str:
+    """Membersihkan nama file agar aman di Windows/GitHub/Streamlit Cloud."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip())
+    return cleaned.strip("_") or "nota"
 
 
 # -----------------------------------------------------------------------------
@@ -128,7 +143,7 @@ def calculate_total(
     Menghitung tagihan Smart Messenger.
 
     Parameter:
-    - distance_km: jarak akumulasi rute messenger.
+    - distance_km: jarak akumulasi rute messenger, bukan jarak per alamat.
     - jobs: daftar pekerjaan/alamat yang diisi user.
     - config: aturan tarif yang dapat disesuaikan.
 
@@ -190,7 +205,7 @@ def build_table_rows(
 ) -> List[Dict[str, str]]:
     """
     Membuat 14 baris sesuai format template.
-    Nilai jarak, jasa, dan total hanya diletakkan pada baris pertama seperti contoh nota.
+    Jarak, biaya jasa, dan total hanya ditampilkan di baris pertama seperti contoh nota.
     """
     rows: List[Dict[str, str]] = []
     for index in range(MAX_TEMPLATE_ROWS):
@@ -213,400 +228,365 @@ def build_table_rows(
 
 
 # -----------------------------------------------------------------------------
-# Renderer HTML untuk preview dan download HTML
+# Helper rendering gambar menggunakan Pillow
 # -----------------------------------------------------------------------------
-def build_invoice_html(
+def _font_path(bold: bool = False) -> str | None:
+    """Mencari font yang umum tersedia di Windows/Linux/Streamlit Cloud."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibrib.ttf" if bold else "C:/Windows/Fonts/calibri.ttf",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def load_font(size: int, scale: int = 2, bold: bool = False) -> ImageFont.ImageFont:
+    """Load font TrueType. Jika gagal, fallback ke font default Pillow."""
+    path = _font_path(bold=bold)
+    if path:
+        return ImageFont.truetype(path, size * scale)
+    return ImageFont.load_default()
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
+    """Mengukur lebar dan tinggi teks pada canvas aktual."""
+    if not text:
+        return 0, 0
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _wrap_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> List[str]:
+    """Membungkus teks agar tidak keluar dari kotak."""
+    text = str(text or "")
+    final_lines: List[str] = []
+    for original_line in text.split("\n"):
+        words = original_line.split()
+        if not words:
+            final_lines.append("")
+            continue
+
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            candidate_width, _ = _text_size(draw, candidate, font)
+            if candidate_width <= max_width:
+                current = candidate
+            else:
+                if current:
+                    final_lines.append(current)
+                current = word
+        if current:
+            final_lines.append(current)
+    return final_lines
+
+
+def draw_text_box(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    box: Tuple[int, int, int, int],
+    font: ImageFont.ImageFont,
+    scale: int,
+    fill: Tuple[int, int, int] = BLACK,
+    align: str = "center",
+    valign: str = "middle",
+    padding: int = 4,
+    line_spacing: float = 1.15,
+) -> None:
+    """Menulis teks di dalam kotak dengan wrapping, alignment, dan padding."""
+    x1, y1, x2, y2 = [int(v * scale) for v in box]
+    pad = padding * scale
+    max_width = max(1, (x2 - x1) - (2 * pad))
+    lines = _wrap_lines(draw, text, font, max_width)
+
+    _, sample_h = _text_size(draw, "Ag", font)
+    line_h = max(1, int(sample_h * line_spacing))
+    total_h = line_h * len(lines)
+
+    if valign == "top":
+        y = y1 + pad
+    elif valign == "bottom":
+        y = y2 - pad - total_h
+    else:
+        y = y1 + ((y2 - y1) - total_h) // 2
+
+    for line in lines:
+        line_w, _ = _text_size(draw, line, font)
+        if align == "left":
+            x = x1 + pad
+        elif align == "right":
+            x = x2 - pad - line_w
+        else:
+            x = x1 + ((x2 - x1) - line_w) // 2
+        draw.text((x, y), line, font=font, fill=fill)
+        y += line_h
+
+
+def draw_cell(
+    draw: ImageDraw.ImageDraw,
+    box: Tuple[int, int, int, int],
+    scale: int,
+    text: str = "",
+    font: ImageFont.ImageFont | None = None,
+    fill: Tuple[int, int, int] | None = None,
+    outline: Tuple[int, int, int] = BLACK,
+    width: int = 1,
+    align: str = "center",
+    valign: str = "middle",
+    padding: int = 4,
+) -> None:
+    """Menggambar satu cell tabel beserta isi teksnya."""
+    x1, y1, x2, y2 = [int(v * scale) for v in box]
+    draw.rectangle((x1, y1, x2, y2), fill=fill, outline=outline, width=max(1, width * scale))
+    if text and font:
+        draw_text_box(draw, text, box, font, scale, align=align, valign=valign, padding=padding)
+
+
+def draw_underlined_value(
+    draw: ImageDraw.ImageDraw,
+    value: str,
+    x: int,
+    y: int,
+    font: ImageFont.ImageFont,
+    scale: int,
+) -> None:
+    """Menulis value metadata dengan underline seperti template Excel."""
+    sx, sy = x * scale, y * scale
+    draw.text((sx, sy), value, font=font, fill=BLACK)
+    text_w, text_h = _text_size(draw, value, font)
+    underline_y = sy + text_h + (2 * scale)
+    draw.line((sx, underline_y, sx + text_w, underline_y), fill=BLACK, width=max(1, scale))
+
+
+def draw_metadata_line(
+    draw: ImageDraw.ImageDraw,
+    label: str,
+    value: str,
+    y: int,
+    fonts: Dict[str, ImageFont.ImageFont],
+    scale: int,
+) -> None:
+    """Menggambar baris metadata kiri: label : value."""
+    draw.text((42 * scale, y * scale), label, font=fonts["meta"], fill=BLACK)
+    draw.text((178 * scale, y * scale), ":", font=fonts["meta"], fill=BLACK)
+    draw_underlined_value(draw, value, 193, y, fonts["meta"], scale)
+
+
+def draw_split_rupiah_cell(
+    draw: ImageDraw.ImageDraw,
+    box: Tuple[int, int, int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    scale: int,
+) -> None:
+    """Menggambar kolom total: Rp di kiri, angka di kanan, mengikuti contoh template."""
+    draw_cell(draw, box, scale, fill=WHITE)
+    x1, y1, x2, y2 = box
+    raw = str(text or "").strip()
+    if raw.startswith("Rp"):
+        amount = raw.replace("Rp", "", 1).strip() or "-"
+    else:
+        amount = raw or "-"
+
+    draw_text_box(draw, "Rp", (x1 + 8, y1, x1 + 42, y2), font, scale, align="left")
+    draw_text_box(draw, amount, (x1 + 42, y1, x2 - 8, y2), font, scale, align="right")
+
+
+def draw_brand(draw: ImageDraw.ImageDraw, fonts: Dict[str, ImageFont.ImageFont], scale: int) -> None:
+    """Menggambar teks brand Brighton di kanan atas secara manual agar tidak pecah di PDF."""
+    x = 745 * scale
+    y = 58 * scale
+
+    brand_font = fonts["brand"]
+    tag_font = fonts["tagline"]
+    yellow = BRIGHTON_YELLOW_RGB
+
+    # Tulis 'Brighton' dengan huruf o berwarna kuning.
+    for text, color in [("Bright", BLACK), ("o", yellow), ("n", BLACK)]:
+        draw.text((x, y), text, font=brand_font, fill=color)
+        w, _ = _text_size(draw, text, brand_font)
+        x += w
+
+    sep_x = x + (22 * scale)
+    draw.line((sep_x, y - (4 * scale), sep_x, y + (88 * scale)), fill=BLACK, width=4 * scale)
+
+    tag_x = sep_x + (26 * scale)
+    draw.text((tag_x, y + (1 * scale)), "Bringing", font=tag_font, fill=BLACK)
+    draw.text((tag_x, y + (43 * scale)), "Dreams Beyond", font=tag_font, fill=BLACK)
+
+
+def build_invoice_image_bytes(
     meta: Dict[str, Any],
     table_rows: List[Dict[str, str]],
     result: CalculationResult,
     config: CalculationConfig,
-    standalone: bool = True,
-) -> str:
-    """Membuat tampilan nota dalam bentuk HTML yang mirip template gambar."""
+    scale: int = 2,
+) -> bytes:
+    """
+    Membuat gambar nota PNG.
+
+    Gambar ini menjadi sumber utama untuk:
+    1. Preview di aplikasi.
+    2. Download gambar PNG.
+    3. Download PDF, agar layout PDF sama persis dengan preview.
+    """
+    img = Image.new("RGB", (BASE_WIDTH * scale, BASE_HEIGHT * scale), WHITE)
+    draw = ImageDraw.Draw(img)
+
+    fonts = {
+        "title": load_font(22, scale, bold=True),
+        "meta": load_font(20, scale),
+        "meta_small": load_font(13, scale),
+        "brand": load_font(62, scale, bold=True),
+        "tagline": load_font(33, scale, bold=True),
+        "header": load_font(20, scale),
+        "header_small": load_font(15, scale),
+        "body": load_font(20, scale),
+        "body_small": load_font(18, scale),
+        "total_label": load_font(38, scale),
+        "total_amount": load_font(34, scale, bold=True),
+        "footer": load_font(20, scale),
+        "footer_bold": load_font(20, scale, bold=True),
+    }
+
+    # ------------------------------------------------------------------
+    # Header nota
+    # ------------------------------------------------------------------
+    draw_text_box(draw, "NOTA SMART MESSEGER", (0, 20, BASE_WIDTH, 55), fonts["title"], scale)
+    draw.line((581 * scale, 52 * scale, 819 * scale, 52 * scale), fill=BLACK, width=2 * scale)
+
+    draw_metadata_line(draw, "Tgl Request", format_date_display(meta.get("tgl_request")), 83, fonts, scale)
+    draw_metadata_line(draw, "Nama Agent", str(meta.get("nama_agent") or ""), 113, fonts, scale)
+    draw_metadata_line(draw, "Kantor", str(meta.get("kantor") or ""), 143, fonts, scale)
+    draw_metadata_line(draw, "Pembayaran", str(meta.get("pembayaran") or ""), 173, fonts, scale)
+
+    # Estimasi tanggal memakai dua baris kecil seperti template.
+    draw.text((42 * scale, 203 * scale), "Estimasi Tanggal", font=fonts["meta_small"], fill=BLACK)
+    draw.text((42 * scale, 225 * scale), "Pengerjaan", font=fonts["meta_small"], fill=BLACK)
+    draw.text((178 * scale, 218 * scale), ":", font=fonts["meta"], fill=BLACK)
+    draw_underlined_value(draw, format_date_display(meta.get("estimasi_tanggal")), 193, 218, fonts["meta"], scale)
+
+    # No rekening diposisikan di tengah supaya tidak tabrakan dengan logo.
     rekening_text = ""
-    if str(meta.get("pembayaran", "")).lower().find("transfer") >= 0:
-        rekening_text = f"No Rekening (Jika Transfer) : {safe_text(meta.get('rekening'))}"
+    if "transfer" in str(meta.get("pembayaran", "")).lower():
+        rekening_text = f"No Rekening (Jika Transfer) : {meta.get('rekening') or ''}"
+    draw_text_box(draw, rekening_text, (528, 164, 980, 226), fonts["body_small"], scale, align="left", valign="middle")
 
-    rows_html = "".join(
-        f"""
-        <tr>
-            <td class="center narrow">{safe_text(row['No'])}</td>
-            <td>{safe_text(row['Alamat'])}</td>
-            <td>{safe_text(row['Tugas'])}</td>
-            <td class="center">{safe_text(row['Jarak'])}</td>
-            <td class="center narrow">{safe_text(row['X'])}</td>
-            <td class="center">{safe_text(row['Tarif'])}</td>
-            <td class="center">{safe_text(row['Biaya Jasa'])}</td>
-            <td class="right total-col">{safe_text(row['Total'])}</td>
-            <td>{safe_text(row['Keterangan'])}</td>
-        </tr>
-        """
-        for row in table_rows
+    draw_brand(draw, fonts, scale)
+
+    # ------------------------------------------------------------------
+    # Tabel utama
+    # ------------------------------------------------------------------
+    x = [0, 40, 440, 610, 732, 764, 872, 1004, 1209, 1400]
+    y_top = 264
+    header_1_h = 38
+    header_2_h = 78
+    header_bottom = y_top + header_1_h + header_2_h
+    row_h = 29
+    total_h = 60
+    total_y = header_bottom + (MAX_TEMPLATE_ROWS * row_h)
+    table_bottom = total_y + total_h
+
+    # Header row-spans dan col-spans.
+    draw_cell(draw, (x[0], y_top, x[1], header_bottom), scale, "No", fonts["header"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[1], y_top, x[2], header_bottom), scale, "Alamat", fonts["header"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[2], y_top, x[3], header_bottom), scale, "Tugas", fonts["header"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[3], y_top, x[6], y_top + header_1_h), scale, "Rumus BBM", fonts["header"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[6], y_top, x[7], y_top + header_1_h), scale, "Biaya Jasa\n(Khusus Pasang)", fonts["header_small"], BRIGHTON_YELLOW_RGB, padding=2)
+    draw_cell(
+        draw,
+        (x[7], y_top, x[8], header_bottom),
+        scale,
+        f"TOTAL\n(Tarif minimum {format_rupiah(config.minimum_bbm)}\nberlaku jika jarak akumulasi\nkurang dari {format_number_id(config.minimum_distance_km)} KM)",
+        fonts["header_small"],
+        BRIGHTON_YELLOW_RGB,
+        padding=3,
     )
+    draw_cell(draw, (x[8], y_top, x[9], header_bottom), scale, "Keterangan", fonts["header"], BRIGHTON_YELLOW_RGB)
 
-    css = f"""
-    <style>
-        * {{ box-sizing: border-box; }}
-        body {{
-            margin: 0;
-            font-family: Arial, Helvetica, sans-serif;
-            color: #000;
-            background: #fff;
-        }}
-        .invoice-page {{
-            width: 100%;
-            max-width: 1280px;
-            margin: 0 auto;
-            padding: 18px 18px 10px 18px;
-            background: #fff;
-        }}
-        .top-title {{
-            text-align: center;
-            font-weight: 800;
-            text-decoration: underline;
-            font-size: 20px;
-            letter-spacing: .2px;
-            margin-bottom: 4px;
-        }}
-        .brand {{
-            text-align: right;
-            font-weight: 900;
-            font-size: 56px;
-            line-height: 1;
-            margin-top: -4px;
-        }}
-        .brand .yellow {{ color: {BRIGHTON_YELLOW}; }}
-        .brand-sub {{
-            font-size: 18px;
-            font-weight: 700;
-            color: #555;
-            margin-left: 8px;
-            vertical-align: middle;
-        }}
-        .meta-grid {{
-            display: grid;
-            grid-template-columns: 420px 1fr;
-            gap: 30px;
-            margin: 4px 0 28px 0;
-            font-size: 18px;
-        }}
-        .meta-line {{
-            display: grid;
-            grid-template-columns: 135px 10px 1fr;
-            margin: 4px 0;
-        }}
-        .meta-small {{ font-size: 12px; line-height: 1.05; }}
-        .underline {{ text-decoration: underline; }}
-        .rekening {{
-            align-self: end;
-            padding-bottom: 36px;
-            font-size: 18px;
-        }}
-        table.invoice {{
-            width: 100%;
-            border-collapse: collapse;
-            table-layout: fixed;
-            font-size: 18px;
-        }}
-        .invoice th, .invoice td {{
-            border: 1px solid #000;
-            padding: 3px 5px;
-            vertical-align: middle;
-            height: 27px;
-            word-wrap: break-word;
-        }}
-        .invoice th {{
-            background: {BRIGHTON_YELLOW};
-            font-weight: 500;
-            text-align: center;
-        }}
-        .invoice .subhead {{ font-size: 14px; line-height: 1.25; }}
-        .center {{ text-align: center; }}
-        .right {{ text-align: right; }}
-        .narrow {{ width: 36px; }}
-        .total-row td {{
-            background: {BRIGHTON_YELLOW};
-            font-weight: 900;
-            font-size: 32px;
-            height: 58px;
-        }}
-        .total-label {{ text-align: center; letter-spacing: 1px; }}
-        .total-amount {{ text-align: center; }}
-        .footnote {{
-            border: 1px solid #000;
-            border-top: none;
-            padding: 6px 38px 2px 38px;
-            font-size: 20px;
-            line-height: 1.45;
-        }}
-        .footnote strong {{ font-weight: 800; }}
-        .calc-info {{
-            margin-top: 12px;
-            padding: 12px 14px;
-            border: 1px dashed #888;
-            border-radius: 10px;
-            font-size: 14px;
-            background: #fffdf3;
-        }}
-        @media print {{
-            .no-print {{ display: none !important; }}
-            .invoice-page {{ max-width: none; padding: 6mm; }}
-            @page {{ size: A4 landscape; margin: 7mm; }}
-        }}
-    </style>
-    """
+    draw_cell(draw, (x[3], y_top + header_1_h, x[4], header_bottom), scale, f"Jarak\nAkumulasi\n(Min {format_number_id(config.minimum_distance_km)} KM)", fonts["header_small"], BRIGHTON_YELLOW_RGB, padding=2)
+    draw_cell(draw, (x[4], y_top + header_1_h, x[5], header_bottom), scale, "X", fonts["header"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[5], y_top + header_1_h, x[6], header_bottom), scale, format_rupiah(config.tariff_per_km), fonts["header"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[6], y_top + header_1_h, x[7], header_bottom), scale, format_rupiah(config.service_fee_per_point), fonts["header"], BRIGHTON_YELLOW_RGB)
 
-    body = f"""
-    <div class="invoice-page">
-        <div class="top-title">NOTA SMART MESSEGER</div>
-        <div class="brand">Bright<span class="yellow">o</span>n <span class="brand-sub">| Bringing<br>Dreams Beyond</span></div>
+    # Body 14 baris.
+    for idx, row in enumerate(table_rows):
+        y1 = header_bottom + (idx * row_h)
+        y2 = y1 + row_h
+        draw_cell(draw, (x[0], y1, x[1], y2), scale, row["No"], fonts["body"], WHITE)
+        draw_cell(draw, (x[1], y1, x[2], y2), scale, row["Alamat"], fonts["body"], WHITE, align="left", padding=5)
+        draw_cell(draw, (x[2], y1, x[3], y2), scale, row["Tugas"], fonts["body"], WHITE, align="left", padding=5)
+        draw_cell(draw, (x[3], y1, x[4], y2), scale, row["Jarak"], fonts["body"], WHITE)
+        draw_cell(draw, (x[4], y1, x[5], y2), scale, row["X"], fonts["body"], WHITE)
+        draw_cell(draw, (x[5], y1, x[6], y2), scale, row["Tarif"], fonts["body"], WHITE)
+        draw_cell(draw, (x[6], y1, x[7], y2), scale, row["Biaya Jasa"], fonts["body"], WHITE)
+        draw_split_rupiah_cell(draw, (x[7], y1, x[8], y2), row["Total"], fonts["body"], scale)
+        draw_cell(draw, (x[8], y1, x[9], y2), scale, row["Keterangan"], fonts["body"], WHITE, align="left", padding=5)
 
-        <div class="meta-grid">
-            <div>
-                <div class="meta-line"><span>Tgl Request</span><span>:</span><span class="underline">{safe_text(format_date_display(meta.get('tgl_request')))}</span></div>
-                <div class="meta-line"><span>Nama Agent</span><span>:</span><span class="underline">{safe_text(meta.get('nama_agent'))}</span></div>
-                <div class="meta-line"><span>Kantor</span><span>:</span><span class="underline">{safe_text(meta.get('kantor'))}</span></div>
-                <div class="meta-line"><span>Pembayaran</span><span>:</span><span class="underline">{safe_text(meta.get('pembayaran'))}</span></div>
-                <div class="meta-line meta-small"><span>Estimasi Tanggal<br>Pengerjaan</span><span>:</span><span class="underline" style="font-size:18px; align-self:end;">{safe_text(format_date_display(meta.get('estimasi_tanggal')))}</span></div>
-            </div>
-            <div class="rekening">{rekening_text}</div>
-        </div>
+    # Baris TOTAL bawah.
+    draw_cell(draw, (x[0], total_y, x[7], table_bottom), scale, "TOTAL", fonts["total_label"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[7], total_y, x[8], table_bottom), scale, format_rupiah(result.total), fonts["total_amount"], BRIGHTON_YELLOW_RGB)
+    draw_cell(draw, (x[8], total_y, x[9], table_bottom), scale, "", fonts["body"], BRIGHTON_YELLOW_RGB)
 
-        <table class="invoice">
-            <colgroup>
-                <col style="width:38px">
-                <col style="width:29%">
-                <col style="width:12.5%">
-                <col style="width:9%">
-                <col style="width:32px">
-                <col style="width:8%">
-                <col style="width:9.5%">
-                <col style="width:15%">
-                <col style="width:14.5%">
-            </colgroup>
-            <thead>
-                <tr>
-                    <th rowspan="2">No</th>
-                    <th rowspan="2">Alamat</th>
-                    <th rowspan="2">Tugas</th>
-                    <th colspan="3">Rumus BBM</th>
-                    <th>Biaya Jasa<br><span class="subhead">(Khusus Pasang)</span></th>
-                    <th rowspan="2">TOTAL<br><span class="subhead">(Tarif minimum {safe_text(format_rupiah(config.minimum_bbm))} berlaku jika jarak akumulasi kurang dari {safe_text(format_number_id(config.minimum_distance_km))} KM)</span></th>
-                    <th rowspan="2">Keterangan</th>
-                </tr>
-                <tr>
-                    <th class="subhead">Jarak Akumulasi<br>(Min {safe_text(format_number_id(config.minimum_distance_km))} KM)</th>
-                    <th>X</th>
-                    <th>{safe_text(format_rupiah(config.tariff_per_km))}</th>
-                    <th>{safe_text(format_rupiah(config.service_fee_per_point))}</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-                <tr class="total-row">
-                    <td colspan="7" class="total-label">TOTAL</td>
-                    <td class="total-amount">{safe_text(format_rupiah(result.total))}</td>
-                    <td></td>
-                </tr>
-            </tbody>
-        </table>
+    # ------------------------------------------------------------------
+    # Footer
+    # ------------------------------------------------------------------
+    footer_top = table_bottom
+    footer_bottom = BASE_HEIGHT
+    draw.rectangle((0, footer_top * scale, BASE_WIDTH * scale, footer_bottom * scale), outline=BLACK, width=scale)
 
-        <div class="footnote">
-            Tarif Smart Messenger berlaku Nasional seluruh Cabang Brighton, jika mendapatkan tarif diluar ketentuan diatas silahkan hubungi<br>
-            HRD Pusat: 0812-3051-3989<br>
-            <strong>Biaya jasa disesuaikan dengan jumlah titik pekerjaan.</strong><br>
-            Salam #MimpiJadiNyata
-        </div>
+    footer_x = 42 * scale
+    footer_y = (footer_top + 8) * scale
+    line_gap = 30 * scale
+    draw.text((footer_x, footer_y), "Tarif Smart Messenger berlaku Nasional seluruh Cabang Brighton, jika mendapatkan tarif diluar ketentuan diatas silahkan hubungi", font=fonts["footer"], fill=BLACK)
+    draw.text((footer_x, footer_y + line_gap), "HRD Pusat: 0812-3051-3989", font=fonts["footer"], fill=BLACK)
+    draw.text((footer_x, footer_y + (line_gap * 2)), "Biaya jasa disesuaikan dengan jumlah titik pekerjaan.", font=fonts["footer_bold"], fill=BLACK)
+    draw.text((footer_x, footer_y + (line_gap * 3)), "Salam #MimpiJadiNyata", font=fonts["footer"], fill=BLACK)
 
-        <div class="calc-info no-print">
-            <strong>Ringkasan perhitungan:</strong><br>
-            Jarak: {safe_text(format_number_id(result.distance_km))} KM × {safe_text(format_rupiah(config.tariff_per_km))} = {safe_text(format_rupiah(result.raw_bbm_fee))}<br>
-            BBM dipakai: {safe_text(format_rupiah(result.bbm_fee))}. {safe_text(result.minimum_note)}<br>
-            Jasa pasang: {safe_text(result.job_count)} titik × {safe_text(format_rupiah(config.service_fee_per_point))} = {safe_text(format_rupiah(result.service_fee))}<br>
-            Total: {safe_text(format_rupiah(result.bbm_fee))} + {safe_text(format_rupiah(result.service_fee))} = <strong>{safe_text(format_rupiah(result.total))}</strong>
-        </div>
-    </div>
-    """
-
-    if standalone:
-        return f"<!doctype html><html><head><meta charset='utf-8'>{css}</head><body>{body}</body></html>"
-    return f"{css}{body}"
+    output = io.BytesIO()
+    img.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output.read()
 
 
 # -----------------------------------------------------------------------------
-# Renderer PDF menggunakan ReportLab
+# Renderer PDF
 # -----------------------------------------------------------------------------
-def make_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
-    """Membuat paragraph ReportLab dengan HTML escaping sederhana."""
-    return Paragraph(safe_text(text).replace("\n", "<br/>").replace("&lt;br/&gt;", "<br/>"), style)
-
-
 def build_pdf_bytes(
     meta: Dict[str, Any],
     table_rows: List[Dict[str, str]],
     result: CalculationResult,
     config: CalculationConfig,
 ) -> bytes:
-    """Membuat file PDF siap download dari data nota."""
+    """
+    Membuat PDF dari gambar nota.
+
+    Pendekatan ini dipilih karena template nota berbentuk fixed layout seperti Excel.
+    Jika dibuat langsung dengan Table ReportLab, teks brand/rekening bisa wrap dan bergeser.
+    Dengan metode gambar -> PDF, hasil PDF sama persis dengan preview dan download PNG.
+    """
+    png_bytes = build_invoice_image_bytes(meta, table_rows, result, config, scale=2)
+
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=landscape(A4),
-        rightMargin=0.5 * cm,
-        leftMargin=0.5 * cm,
-        topMargin=0.35 * cm,
-        bottomMargin=0.35 * cm,
-    )
+    page_width, page_height = landscape(A4)
+    pdf = canvas.Canvas(buffer, pagesize=landscape(A4))
 
-    styles = getSampleStyleSheet()
-    normal = ParagraphStyle("NormalSmall", parent=styles["Normal"], fontName="Helvetica", fontSize=8.7, leading=10)
-    center = ParagraphStyle("CenterSmall", parent=normal, alignment=TA_CENTER)
-    bold_center = ParagraphStyle("BoldCenter", parent=center, fontName="Helvetica-Bold", fontSize=16, leading=18)
-    title_style = ParagraphStyle("Title", parent=bold_center, fontSize=11.5, underline=True)
-    brand_style = ParagraphStyle("Brand", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=31, leading=34, alignment=TA_LEFT)
-    meta_style = ParagraphStyle("Meta", parent=styles["Normal"], fontName="Helvetica", fontSize=10, leading=13)
-    total_style = ParagraphStyle("Total", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=18, leading=22, alignment=TA_CENTER)
-    footer_style = ParagraphStyle("Footer", parent=styles["Normal"], fontName="Helvetica", fontSize=9.5, leading=13)
+    # Gambar dipasang memenuhi halaman A4 landscape.
+    # Ukuran gambar sudah mengikuti rasio A4, jadi tidak perlu preserveAspectRatio.
+    image_reader = ImageReader(io.BytesIO(png_bytes))
+    pdf.drawImage(image_reader, 0, 0, width=page_width, height=page_height)
+    pdf.showPage()
+    pdf.save()
 
-    elements = []
-    elements.append(Paragraph("NOTA SMART MESSEGER", title_style))
-
-    meta_left = (
-        f"Tgl Request&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <u>{format_date_display(meta.get('tgl_request'))}</u><br/>"
-        f"Nama Agent&nbsp;&nbsp;&nbsp;&nbsp;: <u>{safe_text(meta.get('nama_agent'))}</u><br/>"
-        f"Kantor&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <u>{safe_text(meta.get('kantor'))}</u><br/>"
-        f"Pembayaran&nbsp;&nbsp;&nbsp;&nbsp;: <u>{safe_text(meta.get('pembayaran'))}</u><br/>"
-        f"Estimasi Tanggal<br/>Pengerjaan&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <u>{format_date_display(meta.get('estimasi_tanggal'))}</u>"
-    )
-    rekening = ""
-    if str(meta.get("pembayaran", "")).lower().find("transfer") >= 0:
-        rekening = f"No Rekening (Jika Transfer) : {safe_text(meta.get('rekening'))}"
-
-    header_table = Table(
-        [
-            [Paragraph(meta_left, meta_style), Paragraph(rekening, meta_style), Paragraph("Bright<font color='#ffc000'>o</font>n | Bringing<br/>Dreams Beyond", brand_style)]
-        ],
-        colWidths=[8.6 * cm, 9.1 * cm, 10.6 * cm],
-    )
-    header_table.setStyle(
-        TableStyle(
-            [
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ALIGN", (2, 0), (2, 0), "RIGHT"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-            ]
-        )
-    )
-    elements.append(header_table)
-    elements.append(Spacer(1, 0.35 * cm))
-
-    table_data = [
-        [
-            make_paragraph("No", center),
-            make_paragraph("Alamat", center),
-            make_paragraph("Tugas", center),
-            make_paragraph("Rumus BBM", center),
-            "",
-            "",
-            make_paragraph("Biaya Jasa<br/>(Khusus Pasang)", center),
-            make_paragraph(
-                f"TOTAL<br/>(Tarif minimum {format_rupiah(config.minimum_bbm)} berlaku jika jarak akumulasi kurang dari {format_number_id(config.minimum_distance_km)} KM)",
-                center,
-            ),
-            make_paragraph("Keterangan", center),
-        ],
-        [
-            "",
-            "",
-            "",
-            make_paragraph(f"Jarak Akumulasi<br/>(Min {format_number_id(config.minimum_distance_km)} KM)", center),
-            make_paragraph("X", center),
-            make_paragraph(format_rupiah(config.tariff_per_km), center),
-            make_paragraph(format_rupiah(config.service_fee_per_point), center),
-            "",
-            "",
-        ],
-    ]
-
-    for row in table_rows:
-        table_data.append(
-            [
-                make_paragraph(row["No"], center),
-                make_paragraph(row["Alamat"], normal),
-                make_paragraph(row["Tugas"], normal),
-                make_paragraph(row["Jarak"], center),
-                make_paragraph(row["X"], center),
-                make_paragraph(row["Tarif"], center),
-                make_paragraph(row["Biaya Jasa"], center),
-                make_paragraph(row["Total"], center),
-                make_paragraph(row["Keterangan"], normal),
-            ]
-        )
-
-    table_data.append(
-        [
-            "",
-            make_paragraph("TOTAL", total_style),
-            "",
-            "",
-            "",
-            "",
-            "",
-            make_paragraph(format_rupiah(result.total), total_style),
-            "",
-        ]
-    )
-
-    col_widths = [0.75 * cm, 7.9 * cm, 3.4 * cm, 2.3 * cm, 0.65 * cm, 2.1 * cm, 2.6 * cm, 4.1 * cm, 4.2 * cm]
-    invoice_table = Table(table_data, colWidths=col_widths, repeatRows=2)
-
-    footer_index = len(table_data) - 1
-    style_commands = [
-        ("GRID", (0, 0), (-1, -1), 0.55, colors.black),
-        ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor(BRIGHTON_YELLOW)),
-        ("BACKGROUND", (0, footer_index), (-1, footer_index), colors.HexColor(BRIGHTON_YELLOW)),
-        ("SPAN", (0, 0), (0, 1)),
-        ("SPAN", (1, 0), (1, 1)),
-        ("SPAN", (2, 0), (2, 1)),
-        ("SPAN", (3, 0), (5, 0)),
-        ("SPAN", (7, 0), (7, 1)),
-        ("SPAN", (8, 0), (8, 1)),
-        ("SPAN", (0, footer_index), (6, footer_index)),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("ALIGN", (1, 2), (2, footer_index - 1), "LEFT"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 2.2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-    ]
-    invoice_table.setStyle(TableStyle(style_commands))
-    elements.append(invoice_table)
-
-    footer = (
-        "Tarif Smart Messenger berlaku Nasional seluruh Cabang Brighton, jika mendapatkan tarif diluar ketentuan diatas silahkan hubungi<br/>"
-        "HRD Pusat: 0812-3051-3989<br/>"
-        "<b>Biaya jasa disesuaikan dengan jumlah titik pekerjaan.</b><br/>"
-        "Salam #MimpiJadiNyata"
-    )
-    footer_table = Table([[Paragraph(footer, footer_style)]], colWidths=[28.0 * cm])
-    footer_table.setStyle(
-        TableStyle(
-            [
-                ("BOX", (0, 0), (-1, -1), 0.55, colors.black),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ("LEFTPADDING", (0, 0), (-1, -1), 20),
-            ]
-        )
-    )
-    elements.append(footer_table)
-
-    doc.build(elements)
     buffer.seek(0)
     return buffer.read()
 
@@ -615,7 +595,7 @@ def build_pdf_bytes(
 # Session state dan contoh data
 # -----------------------------------------------------------------------------
 def set_example_one_point() -> None:
-    """Mengisi form sesuai contoh gambar pertama."""
+    """Mengisi form sesuai contoh gambar pertama: 1 alamat, jarak 18,8 KM."""
     st.session_state.job_count = 1
     st.session_state.distance_km = 18.8
     st.session_state.nama_agent = "RUDY"
@@ -787,12 +767,11 @@ def main() -> None:
             st.success(f"Total tagihan: {format_rupiah(result.total)}")
 
         st.markdown("#### Preview Nota")
-        invoice_html = build_invoice_html(meta, table_rows, result, config, standalone=False)
-        st.components.v1.html(invoice_html, height=820, scrolling=True)
-
-        full_html = build_invoice_html(meta, table_rows, result, config, standalone=True)
+        png_bytes = build_invoice_image_bytes(meta, table_rows, result, config, scale=2)
         pdf_bytes = build_pdf_bytes(meta, table_rows, result, config)
-        file_suffix = format_date_display(tgl_request).replace("-", "_")
+        st.image(png_bytes, caption="Preview ini sama dengan hasil download PDF dan gambar.", use_container_width=True)
+
+        file_suffix = sanitize_filename(f"{format_date_display(tgl_request)}_{nama_agent or 'agent'}")
 
         download_col_1, download_col_2 = st.columns(2)
         with download_col_1:
@@ -804,10 +783,10 @@ def main() -> None:
             )
         with download_col_2:
             st.download_button(
-                "Download HTML Nota",
-                data=full_html.encode("utf-8"),
-                file_name=f"nota_smart_messenger_{file_suffix}.html",
-                mime="text/html",
+                "Download Gambar Nota",
+                data=png_bytes,
+                file_name=f"nota_smart_messenger_{file_suffix}.png",
+                mime="image/png",
             )
 
         st.markdown("#### Data tabel")
