@@ -120,3 +120,10 @@ Setelah selesai, aplikasi akan memiliki link online dan bisa dipakai langsung da
 - Biaya jasa dihitung dari jumlah titik/alamat yang terisi.
 - Jika tarif kantor berubah, ubah dari sidebar aplikasi tanpa perlu mengedit kode.
 - Untuk hasil paling rapi, gunakan tombol **Download PDF Nota** atau **Download Gambar Nota** dari preview aplikasi.
+
+
+## Catatan penting V3
+
+Versi ini menambahkan dependency `matplotlib` untuk memastikan font TrueType selalu tersedia saat nota dirender menjadi gambar/PDF. Tanpa font TrueType, Pillow dapat memakai font default yang terlalu kecil sehingga hasil download terlihat rusak.
+
+Kalau hasil di Streamlit Cloud masih memakai versi lama, buka dashboard app lalu klik **Reboot app** atau **Redeploy** setelah push file terbaru ke GitHub.

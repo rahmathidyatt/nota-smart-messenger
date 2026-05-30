@@ -231,25 +231,68 @@ def build_table_rows(
 # Helper rendering gambar menggunakan Pillow
 # -----------------------------------------------------------------------------
 def _font_path(bold: bool = False) -> str | None:
-    """Mencari font yang umum tersedia di Windows/Linux/Streamlit Cloud."""
+    """
+    Mencari file font TrueType yang tersedia di komputer/server.
+
+    Kenapa dibuat panjang?
+    Pada beberapa deployment, terutama Streamlit Cloud atau Windows tertentu,
+    Pillow bisa gagal menemukan font sistem. Kalau Pillow memakai font default,
+    hasil nota akan terlihat sangat kecil seperti gambar rusak. Karena itu kita
+    cari font dari beberapa lokasi umum, lalu fallback ke font bawaan Matplotlib.
+    """
     candidates = [
+        # Linux/Streamlit Cloud umum
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf" if bold else "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        # Windows umum
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
         "C:/Windows/Fonts/calibrib.ttf" if bold else "C:/Windows/Fonts/calibri.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
+        # macOS umum
+        "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
     ]
+
     for path in candidates:
         if path and os.path.exists(path):
             return path
+
+    # Fallback paling aman: Matplotlib membawa DejaVu Sans sendiri.
+    # Tidak perlu menyertakan file font manual di project.
+    try:
+        from matplotlib import font_manager
+
+        family = "DejaVu Sans"
+        prop = font_manager.FontProperties(family=family, weight="bold" if bold else "normal")
+        path = font_manager.findfont(prop, fallback_to_default=True)
+        if path and os.path.exists(path):
+            return path
+    except Exception:
+        pass
+
     return None
 
 
 def load_font(size: int, scale: int = 2, bold: bool = False) -> ImageFont.ImageFont:
-    """Load font TrueType. Jika gagal, fallback ke font default Pillow."""
+    """
+    Load font TrueType dengan ukuran yang ikut skala gambar.
+
+    Jika TrueType tidak ditemukan, aplikasi tetap berjalan dengan font default
+    Pillow yang diperbesar. Namun normalnya fallback Matplotlib di atas sudah
+    mencegah teks menjadi terlalu kecil.
+    """
+    font_size = max(8, int(size * scale))
     path = _font_path(bold=bold)
     if path:
-        return ImageFont.truetype(path, size * scale)
-    return ImageFont.load_default()
+        return ImageFont.truetype(path, font_size)
+
+    try:
+        return ImageFont.load_default(size=font_size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
@@ -461,7 +504,7 @@ def build_invoice_image_bytes(
     # ------------------------------------------------------------------
     # Header nota
     # ------------------------------------------------------------------
-    draw_text_box(draw, "NOTA SMART MESSEGER", (0, 20, BASE_WIDTH, 55), fonts["title"], scale)
+    draw_text_box(draw, "NOTA SMART MESSENGER", (0, 20, BASE_WIDTH, 55), fonts["title"], scale)
     draw.line((581 * scale, 52 * scale, 819 * scale, 52 * scale), fill=BLACK, width=2 * scale)
 
     draw_metadata_line(draw, "Tgl Request", format_date_display(meta.get("tgl_request")), 83, fonts, scale)
