@@ -950,7 +950,7 @@ def main() -> None:
         """
         <hr style="margin-top: 40px; margin-bottom: 10px;">
         <div style="text-align: center; color: #777; font-size: 13px;">
-            Created by <b>RH</b> | Nota Smart Messenger
+            created by <b>rh</b>
         </div>
         """,
         unsafe_allow_html=True,
