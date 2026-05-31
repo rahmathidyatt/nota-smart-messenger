@@ -946,6 +946,15 @@ def main() -> None:
         st.markdown("#### Data tabel")
         st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
+    st.markdown(
+        """
+        <hr style="margin-top: 40px; margin-bottom: 10px;">
+        <div style="text-align: center; color: #777; font-size: 13px;">
+            Created by <b>RH</b> | Nota Smart Messenger
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 if __name__ == "__main__":
     main()
