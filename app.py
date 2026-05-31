@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-"""
-Nota Smart Messenger - Versi V4
-================================
-Perbaikan utama versi ini:
-1. Menghapus garis bawah pada judul dan metadata kiri.
-2. Menggabungkan (merge) kolom Jarak / X / Tarif / Biaya Jasa / Total
-   pada baris pekerjaan yang terisi, agar rapi ketika jumlah alamat > 1.
-3. Preview gambar tetap dipertahankan, tetapi file PDF dibuat terpisah
-   secara vektor/editable menggunakan ReportLab (bukan sekadar gambar).
-4. No rekening dipaksa tampil 1 baris agar tidak terpotong.
-5. Struktur kode dirapikan agar mudah dirawat dan dikembangkan.
-"""
+
+#Nota Smart Messenger - Versi V4
+#================================
+#Perbaikan utama versi ini:
+#1. Menghapus garis bawah pada judul dan metadata kiri.
+#2. Menggabungkan (merge) kolom Jarak / X / Tarif / Biaya Jasa / Total
+#   pada baris pekerjaan yang terisi, agar rapi ketika jumlah alamat > 1.
+#3. Preview gambar tetap dipertahankan, tetapi file PDF dibuat terpisah
+#   secara vektor/editable menggunakan ReportLab (bukan sekadar gambar).
+#4. No rekening dipaksa tampil 1 baris agar tidak terpotong.
+#5. Struktur kode dirapikan agar mudah dirawat dan dikembangkan.
+
 
 import io
 import os
